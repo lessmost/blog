@@ -1,0 +1,24 @@
+#+POSTID: 32
+#+DATE: [2012-03-20 二 17:38]
+#+OPTIONS: toc:nil todo:nil pri:nil tags:nil ^:nil TeX:nil
+#+CATEGORY: git
+#+TAGS:
+#+DESCRIPTION: git backup
+#+TITLE: 私有Git代码的备份
+
+* 私有git代码的备份
+私有git代码托管在[[https://bitbucket.org][bitbucket]]上非常的方便，但自己还是要备份下的。Git的
+hook就可以用来自动备份代码了。
+
+在project目录下的新建文件 ~.git/hooks/post-commit
+#+begin_src sh
+  #!/bin/sh
+  
+  project_name=${PWD##*/}
+  git bundle create ~/data/Dropbox/repo/${project_name}.bundle \
+      --all --tags --branches
+#+end_src
+
+然后chmod +x .git/hooks/post-commit。
+
+这样，在commit后就会自动的创建git bundle到指定的目录了。
