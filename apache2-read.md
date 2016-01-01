@@ -1,0 +1,1437 @@
+title: Apache Http Sever 代码阅读
+date: 2013-06-28 22:49:18
+category: OpenSource
+tags: http
+---
+
+<div id="table-of-contents">
+<h2>Table of Contents</h2>
+<div id="text-table-of-contents">
+<ul>
+<li><a href="#orgheadline1">1. Preface</a></li>
+<li><a href="#orgheadline5">2. Hooks</a>
+<ul>
+<li><a href="#orgheadline2">2.1. Hooks的实现</a></li>
+<li><a href="#orgheadline3">2.2. Optional Hook</a></li>
+<li><a href="#orgheadline4">2.3. Apache2中的hook</a></li>
+</ul>
+</li>
+<li><a href="#orgheadline7">3. Filters</a>
+<ul>
+<li><a href="#orgheadline6">3.1. filter的使用</a></li>
+</ul>
+</li>
+<li><a href="#orgheadline13">4. 请求的处理</a>
+<ul>
+<li><a href="#orgheadline8">4.1. create_connection的注册者</a></li>
+<li><a href="#orgheadline9">4.2. pre_connection的注册者</a></li>
+<li><a href="#orgheadline10">4.3. process_connection的注册者</a></li>
+<li><a href="#orgheadline12">4.4. request_rec结构</a>
+<ul>
+<li><a href="#orgheadline11">4.4.1. request_time</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li><a href="#orgheadline14">5. Notes</a></li>
+</ul>
+</div>
+</div>
+
+
+# Preface<a id="orgheadline1"></a>
+
+前一段时间，由于实验室的事情需要看一下Apache HTTP Server的源代码，在
+看的过程中自己就记了一些笔记，这里整理一下传上来，不过代码没有看
+完，之有其中一部分的笔记。
+
+# Hooks<a id="orgheadline5"></a>
+
+Apache2中一个模块可以输出hook，其他的模块可以使用这个hook，hook的输
+出者需要声明和实现hook，提供hook函数，调用这个hook；hook的使用者则使
+用hook函数注册自己的函数，这样注册的函数就会在适当的时候被调用。
+
+## Hooks的实现<a id="orgheadline2"></a>
+
+每一个hook都由宏 `AP_DECLARE_HOOK` 声明的，首先看看 `AP_DECLARE_HOOK`
+这个宏是怎么定义的。
+
+    /**
+     * Declare a hook function
+     * @param ret The return type of the hook
+     * @param name The hook's name (as a literal)
+     * @param args The arguments the hook function takes, in brackets
+     */
+    #define AP_DECLARE_HOOK(ret, name, args) \
+      APR_DECLARE_EXTERNAL_HOOK(ap, AP, ret, name, args)
+
+宏 `APR_DECLARE_EXTERNAL_HOOK` 是在apr-utils中定义。下面来看一下
+`APR_DECLARE_EXTERNAL_HOOK` 的实现。
+
+    /* macro to declare the hook correctly */
+    #define APR_DECLARE_EXTERNAL_HOOK(ns, link, ret, name, args) \
+      typedef ret ns##_HOOK_##name##_t args; \
+      link##_DECLARE(void) ns##_hook_##name(ns##_HOOK_##name##_t *pf, \
+                                           const char * const *aszPre, \
+                                           const char * const *aszSucc, \
+                                           int nOrder); \
+      link##_DECLARE(ret) ns##_run_##name args; \
+      APR_IMPLEMENT_HOOK_GET_PROTO(ns, link, name); \
+      typedef struct ns##_LINK_##name##_t \
+      { \
+      ns##_HOOK_##name_t *pFunc; \
+      const char *szName; \
+      const char * const *aszPredecessors; \
+      const char * const *aszSuccessors; \
+      int nOrder; \
+      } ns##_LINK_##name##_t;
+
+宏首先定义一个函数类型 `ns##_HOOK_##name_t` （定义的方式比较特别，
+和一般使用的函数指针貌似有点差别:(，）; 然后定义了一个函数
+`ns##_hook_##name` ，使用这个函数就可以向这个hook注册一个函数了，注
+册的函数的原型就由 `ns##_HOOK_##name##_t` 定义了。宏同样申明了函数
+`ns##_run_##name` 。
+
+下面看一下宏 `APR_IMPLEMENT_HOOK_GET_PROTO`
+
+    /* macro to return the prototype of the hook function */
+    #define APR_IMPLEMENT_HOOK_GET_PROTO(ns, link, name) \
+      link##_DECLARE(apr_array_header_t *) ns##_hook_get_##name(void)
+
+所以宏 `APR_IMPLEMENT_EXTERNAL_HOOK` 还声明了一个函数   
+`ns##_hook_get_##name` 。
+
+最后宏 `APR_IMPLEMENT_EXTERNAL_HOOK` 定义了结构体   
+`ns##_LINK_##name##_t` 。
+
+上面介绍了hook的声明， `AP_DECLARE_HOOK` 宏声明一个hook，宏要求三个
+参数：hook函数的返回值类型 `ret` ，hook函数的名称 `name` 和hook函数
+的参数列表 `args` 。该宏出现在头文件中以供其他函数使用被定义的hook。
+以hook `header_parser` 为例， `header_parser` 的声明在
+`include/http_config.h` 文件中。 `AP_DECLARE_HOOK(int,
+   header_parser, (request_rec *r))` 一共做了几件事呢：
+\\#+ <a id="orgtarget1"></a>
+
+-   `typedef int ap_HOOK_header_parser_t (request_rec *r);`   
+    定义了一个类型ap\_HOOK\_header\_parser\_t，它是一个函数原型，返回值为
+    int，参数为request\_rec \*r。
+-   `void ap_hook_header_parser(...)`   
+    声明了函数 `ap_hook_header_parser` ，返回类型为 `void` ，参数为   
+    `ap_HOOK_header_parser_t *pf` ,   
+    `const char * const *aszPre` ,   
+    `const char * const *aszSucc` ,   
+    `int nOrder` 。
+-   `int ap_run_header_parser(...)`   
+    声明了函数 `ap_run_header_parser` ，返回类型为 `int` ，参数为   
+    `request_rec *r` 。
+-   `apr_array_header_t * ap_hook_get_header_parser(void)`   
+    声明了函数 `ap_hook_get_header_parser` ，返回类型为   
+    `apr_array_header_t *` 。
+-   `struct ap_LINK_header_parser_t`   
+    定义了结构体 `ap_LINK_header_parser_t` ，其成员有   
+    `ap_HOOK_header_parser_t *`   
+    `const char *szName`   
+    `const char * const *aszPredecessors`   
+    `const char * const *aszSuccessors`   
+    `int nOrder`
+
+一共是两个数据类型和三个函数原型。
+
+下面来看一个hook的实现。同样以 `header_parser` 这个hook为例来看hook的
+实现。
+
+`header_parser` 的实现在 `server/config.c` 里面：
+
+    APR_HOOK_STRUCT(
+        APR_HOOK_LINK(header_parser)
+        APR_HOOK_LINK(pre_config)
+        APR_HOOK_LINK(post_config)
+        APR_HOOK_LINK(open_logs)
+        APR_HOOK_LINK(child_init)
+        APR_HOOK_LINK(handler)
+        APR_HOOK_LINK(quick_handler)
+        APR_HOOK_LINK(optional_fn_retrieve)
+        APR_HOOK_LINK(test_config)
+                    )
+
+宏 `APR_HOOK_STRUCT` 和 `APR_HOOK_LINK` 定义在 `apr-utils` 中：
+
+    /* macro to declare the hook structure */
+    #define APR_HOOK_STRUCT(members) \
+      static struct { members } _hooks;
+    
+    /* macro to link the hook structure */
+    #define APR_HOOK_LINK(name) \
+      apr_array_header_t *link_##name;
+
+可以看到宏 `APR_HOOK_STRUCT` 定义了一个 `static struct` ，即
+`_hooks` 是一个 `static` 结构体，它的成员是一个或者多个
+`apr_array_header_t *` 类型的变量。（注意这个这个结构体是unnamed
+struct，并且是static的，这样做的好处可以想想；unamed不是
+anonymous&#x2026; ）
+
+hook  `header_parser` 在这里就对应着 `server/config.c` 里面的
+`_hooks` 结构体里面的 `apr_array_header_t *link_header_parser` 变量。
+
+通过前面的hook的声明部分，可以知道hook `header_paser` 的[声明](#orgtarget1)声明了
+三个函数，这三个函数在哪实现的呢？
+
+查看Apache HTTP Server的Development Document，可以知道，httpd里面的
+hook有两大类：一类是没有返回值的hook，即hook函数返回类型为void；另
+一类是有返回值的hook，一般是int类型的。
+
+如果hook函数的返回类型是void的，那么所有注册在这个hook上的函数都会
+被执行，这样的hook是这样实现的：
+
+    /**
+     * Implement an Apache core hook that has no return code, and
+     * therefore runs all of the registered functions. The implementation
+     * is called ap_run_<i>name<i>.
+     *
+     * @param name The name of the hook
+     * @param args_decl The declaration of the arguments for the hook, for
+     * example "(int x, void *y)"
+     * @param args_use The arguments for the hook as used in a call, for
+     * example "(x,y)"
+     * @note If IMPLEMENTing a hook that is not linked into the Apache
+     * core, (e.g. within a dso) see APR_IMPLEMENT_EXTERNAL_HOOK_VOID.
+     */
+    #define AP_IMPLEMENT_HOOK_VOID(name,args_decl,args_use) \
+      APR_IMPLEMENT_EXTERNAL_HOOK_VOID(ap,AP,name,args_decl,args_use)
+
+    /**
+     * Implement a hook that has no return code, and therefore runs all of
+     * the registered functions
+     *
+     * @param ns The namespace prefix of the hook functions
+     * @param link The linkage declaration prefix of the hook
+     * @param name The name of the hook
+     * @param args_decl The declaration of the arguments for the hook
+     * @param args_use The names for the argumentsw for the hook
+     * @note The link prefix FOO corresponds to FOO_DECLARE() macro, which
+     * provide export linkage from the module that IMPLEMENTs the hook,
+     * and import linkage from external modules that link to the hook's
+     * module.
+     */
+    #define APR_IMPLEMENT_EXTERNAL_HOOK_VOID(ns,link,args_decl,args_use) \
+      APR_IMPLEMENT_EXTERNAL_HOOK_BASE(ns,link,name) \
+      link##_DECLARE(void) ns##_run_##name args_decl \
+      { \
+      ns##_LINK_##name##_t *pHook; \
+      int n; \
+      if (!_hooks.link_##name) \
+        return; \
+      pHook = (ns##_LINK_##name##_t *)_hooks.link_##name->elts; \
+      for (n = 0; n < _hooks.link_##name->nelts; ++n) \
+        pHook[n].pFunc args_use; \
+      }
+
+    /* macro to implement the hook */
+    #define APR_IMPLEMENT_EXTERNAL_HOOK_BASE(ns,link,name) \
+      link##_DECLARE(void) ns##_hook_##name(ns##_HOOK_##name##_t *pf, \
+                                            const char * const *aszPre, \
+                                            const char * const *aszSucc, \
+                                            int nOrder) \
+      { \
+        ns##_LINK_##name##_t *pHook; \
+        if (!_hooks.link_##name) \
+        { \
+        _hooks.link_##name = apr_array_make(apr_gblobal_pool, \
+                                            1, \
+                                            sizeof(ns##_LINK_##name##_t)); \
+        } \
+        pHook = apr_array_push(_hooks.link_##name); \
+        pHook->pFunc = pf; \
+        pHook->aszPredecessors = aszPre; \
+        pHook->aszSuccessors = aszSucc; \
+        pHook->nOrder = nOrder; \
+        pHook->szName = apr_hook_debug_current; \
+        if (apr_hook_debug_enabled) \
+          apr_hook_debug_show(#name, aszPre, aszSucc); \
+      } \
+      APR_IMPLEMENT_HOOK_GET_PROTO(ns,link,name)    \
+      {                                             \
+        return _hooks.link_##name;                  \
+      }
+
+在前面的介绍中，知道 `_hooks.link_##name` 的类型是   
+`apr_array_header_t *` 类型的，在Apache APR的文档中有很好的说明。
+
+宏 `APR_IMPLMENT_EXTERNAL_HOOK_VOID` 首先调用宏   
+`APR_IMPLEMENT_EXTERNAL_HOOK_BASE` ,HOOK\_BASE宏实现了函数   
+`ns##_hook_##name` 和 函数 `ns##_hook_get_##name` 。HOOK\_VOID然后实现
+了函数 `ns##_run_##name` 。这样可以看到，在hook声明过程中申明的三个
+函数在这里都得到了实现。
+
+函数 `ns##_hook_##name` 主要是将参数中的hook函数添加到staitc结构体
+中对应的array中；函数 `ns##_hook_get_##name` 则用于获取这个array；
+最后一个函数 `ns##_run_##name` 则会运行所有这个array中所有的hook函
+数。
+
+另外一类hook则是有返回值的，这样的hook又可以分为两类，一类是所有注
+册的hook函数都被执行，另一类则是运行部分注册的hook函数，在循环执行
+所有注册的hook函数的过程中，第一个不返回 `DECLINE` 的hook函数终止这
+个循环并记录其返回值，后面的hook函数则不会被执行，然后将返回值返回
+给hook的调用者，这样的hook的实现由宏 `AP_IMPLEMENT_HOOK_RUN_FIRST`
+完成：
+
+    /**
+     * Implement a hook that runs until a function returns something other
+     * than decline. If all functions return decline, the hook runner
+     * returns decline. The implemention is called ap_run_<i>name</i>.
+     *
+     * @param ret The return type of the hook (and the hook runner)
+     * @param name The name of the hook
+     * @param args_decl The declaration of the arguments for the hook, for
+     * example "(int x, void *y)"
+     * @param args_use The arguments for the hook as used in a call for
+     * example "(x,y)"
+     * @param decline The "decline" return value
+     * @return decline or an error.
+     * @note If Implementing a hook that is not linked into the Apache
+     * core (e.g. within a dso) see APR_IMPLEMENT_EXTERNAL_HOOK_RUN_FIRST.
+     */
+    #define AP_IMPLEMENT_HOOK_RUN_FIRST(ret,name,args_decl,args_use,decline) \
+      APR_IMPLEMENT_EXTERNAL_HOOK_RUN_FIRST(ap,AP,ret,name,args_decl, \
+                                            args_use,decline)
+
+    /**
+     * Implement a hook that runs until the first function returns
+     * something other than the value of decline
+     * @param ns The namespace prefix of the hook functions
+     * @param link The linkage declaration prefix of the hook
+     * @param name The name of the hook
+     * @param ret Type to return
+     * @param args_decl The declaration of the argument for the hook
+     * @param args_use The name for the arguments for the hook
+     * @param decline Decline value
+     * @note The link prefix FOO corresponds to FOO_DECLARE() macros,
+     * which provide export linkage from the module that IMPLEMNTs the
+     * hook, and import linkage from external modules that link to the
+     * hook's module.
+     */
+    #define APR_IMPLEMENT_EXTERNAL_HOOK_RUN_FIRST(ns,link,ret,name, \
+                                                  args_decl, args_use, \
+                                                  decline) \
+      APR_IMPLEMENT_EXTERNAL_HOOK_BASE(ns,link,name) \
+      link##DECLARE(ret) ns##_run_##name args_decl \
+      { \
+      ns##_LINK_##name##_t *pHook; \
+      int n; \
+      ret rv; \
+      \
+      if (!_hooks.link_##name) \
+        return decline; \
+      \
+      pHook = (ns##_LINK_##name##_t *)_hooks.link_##name->elts; \
+      for (n = 0; n < _hooks.link_##name->nelts; ++n) \
+      { \
+      rv = pHook[n].pFunc args_use; \
+      if (rv != decline) \
+        return rv; \
+      } \
+      return decline; \
+      }
+
+可以看到， `AP_IMPLEMNET_HOOK_RUN_FIRST` 宏的区别只是实现的函数
+`ns##_run_##name` 不同：在循环执行所有注册hook函数的过程中，当遇到
+第一个返回值不为decline的hook函数后，循环就终止了，后面的hook函数就
+不会被执行了；其余的函数的实现则和void类型hook是一样的。
+
+有返回值的Hook的另外一种是所有注册的hook函数都会被执行，直到遇到错
+误或者全部执行完了。这类hook的实现是由宏   
+`AP_IMPLEMENT_HOOK_RUN_ALL` 完成的：
+
+    /**
+     * Implement an Apache core hook that runs until one of the functions
+     * returns something other than ok or decline. The return valie is
+     * then returned from the hook runner. If the hooks run to completion,
+     * then ok is returned. Note that if no hooks runs it would probably
+     * be more correct to return decline, but this currently does not do
+     * so. The implemention is called ap_run_<i>name</i>.
+     *
+     * @param ret The return type of the hook (and the hook runner)
+     * @param name The name of the hook
+     * @param args_decl The declaration of the arguments for the hook, for
+     * example "(int x, void *y)"
+     * @param ok The "ok" return value
+     * @param decline The "decline" return value
+     * @return ok, decline, or an error
+     * @note If IMPLEMENTing a hook that is not linked into the Apache
+     * core, (e.g. within a dso) see APR_IMPLEMENT_EXTERNAL_HOOK_RUN_ALL.
+     */
+    #define AP_IMPLEMENT_HOOK_RUN_ALL(ret,name,args_decl,args_use, \
+                                      ok,decline) \
+      APR_IMPLEMENT_EXTERNAL_HOOK_RUN_ALL(ap,AP,ret,name,args_decl, \
+                                          args_use,ok,decline)
+
+    /** FIXME: note that this returns ok when noting is run. I suspect it
+     * should really return decline, but that breaks Apache currently - Ben
+     */
+    /**
+     * Implement a hook that runs until one of the functions returns
+     * something other than OK or DECLINE
+     * @param ns The namespace prefix of the hook functions
+     * @param link The linkage declaration prefix of the hook
+     * @param ret Type to return
+     * @param name The name of the hook
+     * @param args_decl The declaration of the arguments for the hook
+     * @param args_use The names for the arguments for the hook
+     * @param ok Success value
+     * @param decline Decline value
+     * @note The link prefix FOO corresponds to FOO_DECLARE() macros,
+     * which provide export linkage from the module that IMPLEMENTs the
+     * hook, and import linkage from external modules that lik to the
+     * hook's module.
+     */
+    #define APR_IMPLEMNET_EXTERNAL_HOOK_RUN_ALL(ns,link,ret,name, \
+                                                args_decl,args_use, \
+                                                ok,decline) \
+      APR_IMPLEMNET_EXTERNAL_HOOK_BASE(ns,link,name) \
+      link##_DECLARE(ret) ns##_run_##name args_decl \
+      { \
+      ns##_LINK_##name##_t *pHook; \
+      int n; \
+      ret rv; \
+      \
+      if (!_hooks.link_##name) \
+        return ok; \
+      \
+      pHook = (ns##_LINK_##name##_t *)_hooks.link_##name->elts; \
+      for (n = 0; n < _hooks.link_##name->nelts; ++n) \
+      { \
+      rv = pHook[n].pFunc args_use; \
+      if (rv != ok && rv != decline) \
+        return rv; \
+      } \
+      return ok; \
+      }
+
+宏 `APR_IMPLEMENT_EXTERNAL_HOOK_RUN_ALL` 和宏   
+`APR_IMPLEMENT_EXTERNAL_HOOK_RUN_FIRST` 很相似，都需要检查注册函数
+执行的返回值，只不过前者是在错误情况（返回值既不为ok也不是decline）
+下终止循环，而后者是在非decline情况下就终止了循环；注意，前者这里有
+一个FIXME标注，在没有hook函数被执行的情况下，前者仍然是返回ok的，这
+和后者的返回decline是不同的。
+
+## Optional Hook<a id="orgheadline3"></a>
+
+Apache2中除了有Hook之外，还有一类Optional hook，还没有仔细研究。
+
+## Apache2中的hook<a id="orgheadline4"></a>
+
+1.  access\_checker
+    
+        /* file: include/http_request.c 331 */
+        /**
+         * This hook is used to apply additional access control to this
+         * resource. It runs *before* a user is authenticated, so this hook is
+         * really to apply additional restrictions independent of a user. It
+         * also runs independent of 'Require' directive usage.
+         *
+         * @param r The current request
+         * @param OK, DECLINE, or HTTP_...
+         */
+        AP_DECLARE_HOOK(int, access_checker, (request_rec *r))
+    
+        /* file: server/request.c 76 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int,access_checker,
+                                  (request_rec *r),
+                                  (r),
+                                  DECLINE)
+2.  auth\_checker
+    
+        /* file: include/http_request.h 344 */
+        /**
+         * This hook is used to check to see if the resource beging requested
+         * is available for the authenticated user (r->user and
+         * r->ap_auth_type). It runs after the access_checker and
+         * check_user_id hooks. Note that it will *only* be called if Apache
+         * determines that access control has been applied to this resource
+         * (though a 'Require' directive).
+         *
+         * @param r The current request
+         * @return OK, DECLINE, or HTTP_...
+         */
+        AP_DECLARE_HOOK(int, auth_checker, (request_rec *r))
+    
+        /* file: server/request.c 78 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(int,auth_checker,
+                                    (request_rec *r),
+                                    (r),
+                                    DECLINE)
+3.  check\_user\_id
+    
+        /* file: include/http_request.h 300 */
+        /**
+         * This hook is used to analyse the request headers, authenticate the
+         * user, and set the user information in the request record (r->user
+         * and r->ap_auth_type). This hook is only run when Apache determines
+         * that authentication/authorization is required for this resource (as
+         * determined by the 'Require' directive). It runs after the
+         * access_checker hook, and before the auth_checker hook.
+         *
+         * @param r The current request
+         * @return OK, DECLINE, or HTTP_...
+         */
+        AP_DECLARE_HOOK(int,check_user_id, (request_rec *r))
+    
+        /* file: server/request.c 70 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(int,check_user_id,
+                                    (request_rec *r),
+                                    (r),
+                                    DECLINE)
+4.  child\_init
+    
+        /* file: include/http_config.h 1022 */
+        /**
+         * Run the child_init functions for each module
+         * @param pchild The child pool
+         * @param s The list of server_recs in this server
+         */
+        AP_DECLARE_HOOK(void, child_init, (apr_pool_t *pchild, server_rec *s))
+    
+        /* file: server/config.c 153 */
+        AP_IMPLEMENT_HOOK_VOID(child_init,
+                               (apr_pool_t *pchild, server_rec *s),
+                               (pchild, s))
+5.  create\_connection
+    
+        /* file: include/http_connection.h 94 */
+        /**
+         * create_connection is a RUN_FIRST hook which allows modules to
+         * create connections. In general, you should not install filters with
+         * the create_connection hook. If you require vhost configuration
+         * information to make filter installation decisions, you must use the
+         * pre_connection or install_network_transport hook. This hook should
+         * close the connection if it encounters a fatal error condition.
+         *
+         * @param p The pool from which to allocate the connection record
+         * @param server The server record to create the connection too.
+         * @param csd The socket that has been accepted
+         * @param conn_id A unique identifier for this connection. The ID only
+         * needs to be unique at that time, not forever.
+         * @param sbh A handle to scoreboard information for this connection.
+         * @param alloc The bucket allocator to use for all bucket/bridge
+         * creations
+         * @return An allocated connection record or NULL
+         */
+        AP_DECLARE_HOOK(conn_rec *, create_connection,
+                        (apr_pool_t *p, server_rec *server, apr_socket_t *csd,
+                         long conn_id, void *sbh, apr_bucket_alloc_t *alloc))
+    
+        /* file: server/connection.c 40 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(conn_rec *,create_connection,
+                                    (apr_pool_t *p, server_rec *server, apr_socket_t *csd, long conn_id, void *sbh, apr_bucket_alloc_t *alloc),
+                                    (p, server, csd, conn_id, sbh, alloc),
+                                    NULL)
+6.  create\_request
+    
+        /* file: include/http_request.h 261 */
+        /**
+         * Gives modules a chance to create their request_config entry when
+         * the request is created.
+         * @param r The current request
+         * @ingroup hooks
+         */
+        AP_DECLARE_HOOK(int, create_request, (request_rec *r))
+    
+        /* file: server/request.c 81 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, create_request,
+                                  (request_rec *r),
+                                  (r),
+                                  OK, DECLINE)
+7.  default\_port
+    
+        /* file: include/http_protocol.h */
+        /**
+         * Return the default port from the current request
+         * @param r The current request
+         * @return The current port
+         */
+        AP_DECLARE_HOOK(apr_port_t, default_port, (const request_rec *r))
+    
+        /* file: server/protocol.c */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(unsigned short,default_port,
+                                    (const request_rec *r),
+                                    (r),
+                                    0)
+8.  error\_log
+    
+        /* file: include/http_log.h 350 */
+        /**
+         * hook method to log error messages
+         * @ingroup hooks
+         * @param file The file in which this function is called
+         * @param line The line number on which the function is called
+         * @param level The level of the this error message
+         * @param status The status code from the previous command
+         * @param s The server which we are logging for
+         * @param r The request which we are logging for
+         * @param pool Memeory pool to allocate from
+         * @param errstr Message to log
+         */
+        AP_DECLARE_HOOK(void, error_log, (const char *file, int line,
+                                          int level, apr_status_t status,
+                                          const server_rec *s,
+                                          const request_rec *r,
+                                          apr_pool_t *pool,
+                                          const char *errstr))
+    
+        /* file: server/log.c 1116 */
+        AP_IMPLEMENT_HOOK_VOID(error_log,
+                               (const char *file, int line, int level,
+                                apr_status_t status, const server_rec *s,
+                                const request_rec *r, apr_pool_t *pool,
+                                const char *errstr), (file, line, level,
+                                                      status, s, r, pool,
+                                                      errstr))
+9.  fatal\_exception
+    
+        /* file: include/ap_mpm.h 183 */
+        AP_DECALRE_HOOK(int, fatal_exception, (ap_exception_info_t *ei))
+    
+        /* file: server/mpm_common.c 67 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, fatal_exception,
+                                  (ap_exception_info_t *ei), (ei),
+                                  OK, DECLINE)
+10. fixups
+    
+        /* file: include/http_request.h 309 */
+        /**
+         * Allows modules to perform module-sepcific fixing of header
+         * fields. This is invoked just before any content-handler
+         * @param r The current request
+         * @return OK, DECLINE, or HTTP_...
+         */
+        AP_DECLARE_HOOK(int, fixups, (request_rec *r))
+    
+        /* file: server/request.c 72 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int,fixups,
+                                  (request_rec *r), (r),
+                                  OK, DECLINE)
+11. get\_mgmt\_items
+    
+        /* file: include/http_core.h 685 */
+        /**
+         * This hook provides a way for modules to provide mterics/statics
+         * about their operational status.
+         *
+         * @param p A pool to use to create entries in the hash table
+         * @param val The name of the paramter(s) that is wanted. This is
+         * tree-structured would be in the form ('*' is all the tree,
+         * 'module.*' all of the module, 'module.foo.*', or 'module.foo.bar')
+         * @param ht The hash table to store the result. Keys are item names,
+         * and the value point to ap_mgmt_item_t strutures.
+         * @ingroup hooks
+         */
+        AP_DECLARE_HOOK(int, get_mgmt_items,
+                        (apr_pool_t *p, const char *val, apr_hash_t *ht))
+    
+        /* file: server/core.c 76 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, get_mgmt_items,
+                                  (apr_pool_t *p, const char *val, apr_hash_t *ht),
+                                  (p, val, ht),
+                                  OK, DECLINE)
+12. get\_suexec\_identity
+    
+        /* file: os/unix/unixd.h */
+        AP_DECLARE_HOOK(ap_unix_identity_t *, get_suexec_identiy, (const request_rec *r))
+    
+        /* file: os/unix/unixd.c 344 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(ap_unix_identity_t *, get_suexec_identity,
+                                    (const request_rec *r), (r),
+                                    NULL)
+13. handler
+    
+        /* file: include/http_config.h 1029 */
+        /**
+         * Run the handler function for each module
+         * @param r The request_rec
+         * @remark non-wildcard handlers should HOOK_MIDDLE, wildcard HOOK_LAST
+         */
+        AP_DECLARE_HOOK(int, handler, (request_rec *r))
+    
+        /* file: server/config.c 157 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(int, handler, (request_rec *r),
+                                    (r), DECLINE)
+14. header\_parser
+           #+ <a id="orgtarget2"></a>
+    
+        1  /* file: include/http_config.h 975 */
+        2  /**
+        3   * Run the header parser functions for each module
+        4   * @param r The current request
+        5   * @return OK or DECLINED
+        6   */
+        7  AP_DECLARE_HOOK(int, header_parser, (request_rec *r))
+    
+        /* file: server/config.c 79 */
+        AP_IMPLEMENT_RUN_ALL(int, header_parser,
+                             (request_rec *r),
+                             (r),
+                             OK, DECLINE)
+15. http\_scheme
+    
+        /* file: include/http_protocol.h 592 */
+        /**
+         * This hook allows modules to retrieve the http scheme for a
+         * request. This allows Apache modules to easily extend the schemes
+         * that Apache understands
+         * @param r The current request
+         * @return The http scheme from the request
+         */
+        AP_DECLARE_HOOK(const char *, http_scheme, (const request_rec *r))
+    
+        /* file: server/protocol.c 1698 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(const char *, http_scheme,
+                                    (const request_rec *r),
+                                    (r),
+                                    NULL)
+16. insert\_error\_filter
+    
+        /* file: include/http_protocol.h 45 */
+        /**
+         * This hook allows modules to insert filters for the current error
+         * response
+         * @param r The current request
+         * @ingroup hooks
+         */
+        AP_DECLARE_HOOK(void, insert_error_filter, (request_rec *r))
+    
+        /* file: modules/http/http_protocol.c 148 */
+        AP_IMPLEMENT_HOOK_VOID(insert_error_filter, (request_rec *r), (r))
+17. insert\_filter
+    
+        /* file: include/http_request.h 351 */
+        /**
+         * This hook allows modules to insert filters for the current request
+         * @param r The current request
+         */
+        AP_DECLARE_HOOK(void, insert_filter, (request_rec *r))
+    
+        /* file: server/request.c 80 */
+        AP_IMPLEMENT_HOOK_VOID(insert_filter, (request_rec *r), (r))
+18. log\_transaction
+    
+        /* file: include/http_protocol.h 584 */
+        /**
+         * This hook allows modules to preform any module-specific logging
+         * activities over and above the normal server things.
+         * @param r The current request
+         * @return OK, DECLINE, or HTTP_...
+         */
+        AP_DECLARE_HOOK(int, log_transaction, (request_rec *r))
+    
+        /* file: server/protocol.c 1696 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int,log_transaction,
+                                  (request_rec *r), (r),
+                                  OK, DECLINE)
+19. map\_to\_storage
+    
+        /* file: include/http_request.h 286 */
+        /**
+         * This hook allow modules to set the per_dir_config based on their
+         * own context (such as "<proxy>" sections) and the responds to
+         * contextless requests such as TRACE that need no security or
+         * filesystem mapping.
+         * @param r The current request
+         * @return DONE or (HTTP_) if this contextless request was just
+         * fulfilled (such as TRACE), OK if this is not a file, or DECLINE  if
+         * this is a file.
+         * The core map_to_strorage (HOOK_RUN_REALLY_FIRST) will
+         * directory_walk and file_walk the r->filename.
+         */
+        AP_DECLARE_HOOK(int, map_to_strorage, (request_rec *r))
+    
+        /* file: server/request.c 68 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(int,map_to_storage,
+                                    (request_rec *r), (r),
+                                    DECLINE)
+20. monitor
+    
+        /* file: include/mpm_common.h 379 */
+        AP_DECLARE_HOOK(int, monitor, (apr_pool_t *p))
+    
+        /* file: server/mpm_common.c 74 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, monitor,
+                                  (apr_pool_t *p),
+                                  (p),
+                                  OK, DECLINE)
+21. open\_logs
+    
+        /* file: include/http_config.h 1014 */
+        /**
+         * Run the open_logs function for each module
+         * @param pconf The config pool
+         * @param plog The logging streams pool
+         * @param ptemp The temporary pool
+         * @param s The list of server_recs
+         * @return OK or DECLINED on success anything else is a error
+         */
+        AP_DECLARE_HOOK(int, open_logs, (apr_pool_t *pconf, apr_pool_t *plog,
+                                         apr_pool_t *ptemp, server_rec *s))
+    
+        /* file: server/config.c 148 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, open_logs,
+                                  (apr_pool_t *pconf, apr_pool_t *plog,
+                                   apr_pool_t *ptemp, server_rec *s),
+                                  (pconf, plog, ptemp, s),
+                                  OK, DECLINE)
+22. optional\_fn\_retrieve
+    
+        /* file: include/http_config.h 1049 */
+        /**
+         * Retrieve the optional functions for each module.
+         * This is run immediately before the server starts. Optional
+         * functions should be registered during the hook registration phase.
+         */
+        AP_DECLARE_HOOK(void, optional_fn_retrieve, (void))
+    
+        /* file: server/config.c 163 */
+        AP_IMPLEMENT_HOOK_VOID(optional_fn_retrieve, (void), ())
+23. post\_config
+    
+        /* file: include/http_config.h 1003 */
+        /**
+         * Run the post_config function for each module
+         * @param pconf The config pool
+         * @param plog The logging streams pool
+         * @param ptemp The temporary pool
+         * @param s The list of server_recs
+         * @return OK or DECLINED on success anything else is a error
+         */
+        AP_DECLARE_HOOK(int, post_config, (apr_pool_t *pconf, apr_pool_t *plog
+                                           apr_pool_t *ptemp, server_rec *s))
+    
+        /* file: server/config.c 91 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, post_config,
+                                  (apr_pool_t *pconf, apr_pool_t *plog,
+                                   apr_pool_t *ptemp, server_rec *s),
+                                  (pconf, plog, ptemp, s),
+                                  OK, DECLINE)
+24. post\_read\_request
+    
+        /* file: include/http_protocol.h 576 */
+        /**
+         * post_read_request --- run right after read_request or
+         * internal_redirect and not run during any subrequests.
+         */
+        /**
+         * This hook allows modules to affect the request immediately after
+         * the request has been read, and before any other phases have been
+         * processes. This allows modules to make decisions based upon the
+         * input header fields
+         * @param r The current request
+         * @return OK or DECLINE
+         */
+        AP_DECLARE_HOOK(int, post_read_request, (request_rec *r))
+    
+        /* file: server/protocol.c 1694 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, post_read_request,
+                                  (request_rec *r), (r),
+                                  OK, DECLINE)
+25. pre\_config
+    
+        /* file: include/http_config.h 984 */
+        /**
+         * Run the pre_config function for each module
+         * @param pconf The config pool
+         * @param plog The logging streams pool
+         * @param ptemp The temporary pool
+         * @return OK or DECLINED on success anything else is a error
+         */
+        AP_DECLARE_HOOK(int, pre_config, (apr_pool_t *pconf, apr_pool_t *plog,
+                                          apr_pool_t *temp))
+    
+        /* file: server/config.c 82 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, pre_config,
+                                  (apr_pool_t *pconf, apr_pool_t *plog,
+                                   apr_pool_t *ptemp),
+                                  (pconf, plog, ptemp),
+                                  OK, DECLINE)
+26. pre\_connection
+    
+        /* file: include/http_connection.h 108 */
+        /**
+         * This hook gives protocol modules an opportunity to set everything
+         * up before calling the protocol handler. All pre_connection hooks
+         * are run until one returns something other than ok or decline
+         *
+         * @param c The connection on which the request has been received.
+         * @param csd The mechanism on which this connection is to be
+         * read. Most times this will be a socket, but it is up to the module
+         * that accepts the request to determine the exact type.
+         * @return OK or DECLINE
+         */
+        AP_DECLARE_HOOK(int, pre_connection, (conn_rec *C, void *csd))
+    
+        /* file: server/connection.c 44 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, pre_connection,
+                                  (conn_rec *c, void *csd),
+                                  (c, csd),
+                                  OK, DECLINE)
+27. pre\_mpm
+    
+        /* file: include/scoreboard.h 212 */
+        /**
+         * Hook for post scoreboard createion, pre mpm.
+         * @param p Apache pool to allocate from
+         * @param sb_type
+         * @return OK or DECLINE on success; anything else is a error
+         */
+        AP_DECLARE_HOOK(int, pre_mpm, (apr_pool_t *p, ap_scoreboard_e sb_type))
+    
+        /* file: server/scoreboard.c 60 */
+        AP_IMPLEMENT_HOOK_RUN_ALL(int, pre_mpm,
+                                  (apr_pool_t *p, ap_scoreboard_e sb_type),
+                                  (p, sb_type),
+                                  OK, DECLINE)
+28. process\_connection
+    
+        /* file: include/http_connection.h 118 */
+        /**
+         * This hook implements different protocols. After a connection has
+         * been established, the protocol module must read and serve the
+         * request. This function does that for each protocol module. Ths
+         * first protocol module to handle the request is the last module run.
+         *
+         * @param c The connection on which the request has been received.
+         * @return OK or DECLINE
+         */
+        AP_DECLARE_HOOK(int, process_connection, (conn_rec *c))
+    
+        /* file: server/connection.c 43 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(int, process_connection,
+                                    (conn_rec *c), (c),
+                                    DECLINE)
+29. quick\_handler
+    
+        /* file: include/http_config.h 1042 */
+        /**
+         * Run the quick handler functions for each module. The quick_handler
+         * is run before any other requests hooks are called (location_walk,
+         * directory_walk, access checking, et. al.). This hook was added to
+         * provide a quick way to server content from a URI keyed cache.
+         *
+         * @param r The request_rec
+         * @param lookup_uri Controls whether the caller actually wants
+         * content of not. look up is set when the quick_handler is called out
+         * of ap_sub_req_lookup_uri()
+         */
+        AP_DECLARE_HOOK(int, quick_handler, (request_rec *r, int lookup_uri))
+    
+        /* file: server/config.c 160 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(int, quick_handler,
+                                    (request_rec *r, int lookup),
+                                    (r, lookup),
+                                    DECLINE)
+30. test\_config
+    
+        /* file: include/http_config.h 993 */
+        /**
+         * Run the test_config function for each module; this hook is run
+         * only if the server was invoked to test the configuration syntax.
+         * @param pconf The config pool
+         * @param s The list of server_recs
+         */
+        AP_DECLARE_HOOK(void, test_config, (apr_pool_t *pconf, server_rec *s))
+    
+        /* file: server/config.c 87 */
+        AP_IMPLEMENT_HOOK_VOID(test_config,
+                               (apr_pool_t pconf, server_rec *s),
+                               (pconf, s))
+31. translate\_name
+    
+        /* file: include/http_request.h 271 */
+        /**
+         * This hook allows modules an opportunity to translate the URI into
+         * an actual filename. If no modules do anything special, the server's
+         * default rules will be followed.
+         * @param r The current request
+         * @return OK, DECLINE, or HTTP_...
+         */
+        AP_DECLARE_HOOK(int, translate_name, (request_rec *r))
+    
+        /* file: server/request.c 66 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(int, transalte_name,
+                                    (request_rec *r),
+                                    (r), DECLINE)
+32. type\_checker
+    
+    <div class="org-center">
+        /* file: include/http_request.h 319 */
+        /**
+         * This routine is called to determine and/or set the various document
+         * type information bits, link Content-type (via r->content_type),
+         * language, et cetera.
+         * @param r The current request
+         * @return OK, DECLINE, or HTTP_...
+         */
+        AP_DECLARE_HOOK(int, type_checker)
+    
+        /* file: server/request.c 74 */
+        AP_IMPLEMENT_HOOK_RUN_FIRST(int, type_checker,
+                                    (request_rec *r),
+                                    (r),
+                                    DECLINE)
+    </div>
+
+够多吧。。
+
+# Filters<a id="orgheadline7"></a>
+
+Filters是Apache2中的另一个特点，在一般http server中，请求从客户端发
+送，server接受后直接交给http server处理，http处理后的结果则直接通过
+网络返回给客户端；但在Apache2中，从客户端发送来的请求，可以被Apache2
+中的模块处理后，再交于http模块处理请求，http模块处理后返回的结果也不
+是直接返回给客户端，其他的模块可以先处理http模块的返回结果后，再传给
+客户端，这就是Apache2中的filters。
+
+模块可以创作input\_filter或者output\_filter，http请求在被结果后，请求
+首先被这些input\_filter处理，一层层的input\_filter处理完成后，在由http
+模块来处理http请求，http模块的处理结果则首先被output\_filter处理，所
+有的output\_filter处理完成后，最后通过网络发送出去。
+
+filters的设计使得某些功能相当容易实现，比如加解密操作，压缩与解压缩
+操作等等。
+
+## filter的使用<a id="orgheadline6"></a>
+
+在模块中，filters需要注册:
+
+    /**
+     * This function is used to register an output filter with the
+     * system. After this registration is performed, then a filter may be
+     * added into the filter chian by using ap_add_output_filter() and
+     * simply specifying the name. It may also be used as a provider under
+     * mod_filter. This is (equivalent to)
+     * ap_register_output_filter_protocol with proto_flag=0, and is
+     * retained for back-compatibility with 2.0 modules.
+     *
+     * @param name The name to attach to the filter function
+     * @param filter_func The filter function to name
+     * @param filter_init The function to call before the filter handlers
+     * are invoked
+     * @param ftype The type of filter function, either ::AP_FTYPE_CONTENT
+     * or ::AP_FTYPE_CONNECTION
+     */
+    AP_DECLARE(ap_filter_rec_t *) ap_register_output_filter(const char *name,
+                                                            ap_out_filter_func filter_func,
+                                                            ap_init_filter_func filter_init,
+                                                            ap_filter_type ftype);
+
+    /**
+     * This function is used to register an input filter with the
+     * system. After this registration is performed, then a filter may be
+     * added into the filter chain by using ap_add_input_filter() and
+     * simply specifying the name.
+     *
+     * @param name The name to attach to the filter function
+     * @param filter_func The function to call before the filter handlers
+     * are invoked
+     * @param ftype The type of filter function, either ::AP_FTYPE_CONTENT
+     * or ::AP_FTYPE_CONNECTION
+     */
+    AP_DECLARE(ap_filter_rec_t *r) ap_register_input_filter(const char *name,
+                                                            ap_in_filter_func filter_func,
+                                                            ap_init_filter_func filter_init,
+                                                            ap_filter_type ftype);
+
+在filter被注册后，就可以将filter加入到filter chain之中了，加入的方
+法有有很多。下面两个函数可以将filter添加到filter chain：
+
+    /*
+     * Add a filter to the current request. Filters are added in a FIFO
+     * manner. The first filter added will be the first filter called.
+     * @param name The name of the filter to add
+     * @param ctx Context data to set in the filter
+     * @param r The request to add this filter for (or NULL if it isn't
+     * associated with a request)
+     * @param c The connection to add this filter for
+     */
+    AP_DECLARE(ap_filter_t *) ap_add_output_filter(const char *name,
+                                                   void *ctx,
+                                                   request_rec *r,
+                                                   conn_rec *c);
+
+    /*
+     * Adds a named filter into the filter chain on the specified request record.
+     * The filter will be installed with the specified context pointer.
+     *
+     * Filters added in this way will be always be placed at the end of
+     * the filters that have the same type (thus, the filters have the
+     * same order as the calls to ap_add_filter). If the current filter
+     * chain contains filters from another request, than this filter will
+     * be added before those other filters.
+     *
+     * To re-iterate that last comment. This function is building a FIFO
+     * list of filters. Take note of that when adding you filter to the chain.
+     *
+     * @param name The name of the filter to add
+     * @param ctx Context data to provide to the filter
+     * @param r The request to add this filter for (or NULL if it isn't
+     * associated with a request)
+     * @param c The connection to added the filter for
+     */
+    AP_DECLARE(ap_filter_t *) ap_add_input_filter(const char *name,
+                                                  void *ctx,
+                                                  request_rec *r,
+                                                  conn_rec *c);
+
+一种方法是首先使用hook insert\_filter，向这个hook注册一个hook函数，在函
+数里决定是否添加filter到filter chain。
+
+源代码modules/experimental/里面有两个最简单的filter示例：
+mod\_case\_filter和mode\_case\_filter\_in，这两个filter的功能就是把输出
+或者输入全部大写化，一个简单的 `toupper` 操作。
+
+# 请求的处理<a id="orgheadline13"></a>
+
+这里以hook执行的顺序来解释http请求在Apache2中处理的过程。在accept到
+一个连接后，首先执行的hook是 `create_connection` :
+
+    /*
+     * We now have a connection, so set it up with the appropriate socket
+     * options, file descriptors, and read/write buffer.
+     */
+    current_connection = ap_run_create_connection(ptrans, ap_server_conf, csd, my_child_num, sbh, bucket_alloc);
+
+然后是 `pre_connection` ，在函数 `ap_process_connection` 中被调用：
+
+    rc = ap_run_pre_connection(c, csd);
+
+再是 `process_connection` ，同样是在函数 `ap_process_connection` 中
+被调用的：
+
+    ap_run_process_connection(c);
+
+这些hook运行完了，处理就处理完了。
+
+下面看有那些模块都向这些hook注册了hook函数的呢？
+
+## create\_connection的注册者<a id="orgheadline8"></a>
+
+`create_connection` 是一个RUN\_FIRST类型的hook，为什么呢？因为在
+server/connection.c里面的 `create_connection` 的实现是这样的:
+
+    AP_IMPLEMENT_HOOK_RUN_FIRST(conn_rec *, create_connection,
+                                (apr_pool_t *p,
+                                 server_rec *server,
+                                 apr_socket_t *csd,
+                                 long conn_id,
+                                 void *sbh,
+                                 apr_bucket_alloc_t *alloc),
+                                (p, server, csd, conn_id, sbh, alloc),
+                                NULL)
+
+这最后一个参数是NULL，代表什么意思呢，在前面的hook实现中已经知道了，
+最后一个参数是 `decline` 的值，这就说明如果 `create_connect` 的注册
+函数如果返回NULL就是返回了decline了，这样下一个hook将继续执行，如果
+返回的是非NULL，后面的hook就不会被执行的，将直接返回这个值给
+`create_connection` 的调用者。
+
+下面看看都有谁注册了宏 `create_connection` 呢？这个只要看谁调用了
+`ap_hook_create_connection` 就可以了：发现只有已有一个模块core
+module注册了这个hook：
+
+    ap_hook_create_connection(core_create_conn, NULL, NULL,
+                              APR_HOOK_REALLY_LAST);
+
+`core_create_conn` 做的事情就是创建 `conn_rec` 对象，并填好其中的各
+个字段，如本地ip，远端ip等等。
+
+## pre\_connection的注册者<a id="orgheadline9"></a>
+
+`pre_connection` 是一个RUN\_ALL类型的hook：
+
+    AP_IMPLEMENT_HOOK_RUN_ALL(int, pre_connection,
+                              (conn_rec *c, void *csd),
+                              (c, csd),
+                              OK,
+                              DECLINE)
+
+注册hook `pre_connection` 的模块就很多了。下面列出version 2.2.21源
+代码中注册了 `pre_connection` 的模块：
+
+1.  core\_module
+    core\_module(server/core.c)在register hooks的过程中注册了
+    `pre_connection`:
+    
+        ap_hook_pre_connection(core_pre_connection, NULL, NULL,
+                               APR_HOOK_REALLY_LAST);
+    
+    `core_pre_connection` 设置了连接的timeout等属性，并添加了一个
+    input\_filter和一个output\_filter：
+    
+        ap_add_input_filter_handle(ap_core_input_filter_handle, net, NULL, net->c);
+        ap_add_output_filter_handle(ap_core_output_filter_handle, net, NULL, net->c);
+2.  logio\_module
+    logio\_module(modules/loggers/mod\_logio.c)注册了
+    `pre_connection` :
+    
+        ap_hook_pre_connection(logio_pre_conn, NULL, NULL, APR_HOOK_MIDDLE);
+    
+    函数 `logio_pre_conn` 同样添加了两个filter到filter chain里面：
+    
+        ap_add_input_filter(logio_filter_name, NULL, NULL, c);
+        ap_add_output_filter(logio_filter_name, NULL, NULL, c);
+3.  dumpio\_module
+          dumpio\_module(modules/debug/mod\_dumpio.c)：
+    
+        ap_hook_pre_connection(dumpio_pre_conn, NULL, NULL, APR_HOOK_MIDDLE);
+    
+    函数 `dumpio_pre_conn` 根据配置选择是否添加两个filters：
+    
+        dumpio_conf_t *ptr =
+            (dumpio_conf_t *) ap_get_module_config(c->base_server->module_config,
+                                                   &dumpio_module);
+        
+        if (ptr->enable_input)
+          ap_add_input_filter("DUMPIO_IN", NULL, NULL, c);
+        if (ptr->enable_output)
+          ap_add_output_filter("DUMPIO_OUT", NULL, NULL, c);
+4.  ssl\_module
+          ssl\_module(modules/ssl/mod\_ssl.c)：
+    
+        ap_hook_pre_connection(ssl_hook_pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
+5.  nwssl\_module
+          nwssl\_module(modules/arch/netware/mod\_nw\_ssl.c)：
+    
+        ap_hook_pre_connection(nwssl_pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
+6.  example\_module 
+          示例模块example\_module(modules/experimental/mod\_example.c)：
+    
+        ap_hook_pre_connection(x_pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
+    
+    函数 `x_pre_connection` 什么也没做，之是简单的log trace一下。
+
+## process\_connection的注册者<a id="orgheadline10"></a>
+
+`process_connection` 是一个RUN\_FIRST类型的hook，在
+server/connection.c里面：
+
+    AP_IMPLEMENT_HOOK_RUN_FIRST(int, process_connection,
+                                (conn_rec *r),
+                                (c),
+                                DECLINE)
+
+注册 `process_connection` 的模块有：
+
+1.  http\_module
+    
+        /*
+         * If we are using an MPM that supports Async Connections,
+         * use a different processing function
+         */
+        int async_mpm = 0;
+        if (ap_mpm_query(AP_MPMQ_IS_ASYNC, &async_mpm) == APR_SUCCESS
+            && async_mpm == 1) {
+          ap_hook_process_connection(ap_process_http_async_connection,
+                                     NULL,
+                                     NULL,
+                                     APR_HOOK_REALLY_LAST);
+        }
+        else {
+          ap_hook_process_connection(ap_process_http_connection,
+                                     NULL,
+                                     NULL,
+                                     APR_HOOK_REALLY_LAST);
+        }
+    
+    函数 `ap_mpm_query` 是每个MPM都必须实现的函数，用于查询MPM的属性，
+    http\_module在这里查询了 `AP_MPMQ_IS_ASYNC` 这个属性，目前在所有
+    的MPM中，只有event这个MPM支持 `AP_MPMQ_IS_ASYNC` 这个属性，所以
+    这里主要观察函数 `ap_process_http_connection` :
+    
+    `ap_process_http_connection` 的主体是一个循环的调用
+    `ap_read_request` :
+    
+        static int ap_process_http_connection(conn_rec *c)
+        {
+          request_rec *r;
+          apr_socket_t *csd = NULL;
+          /*
+           * Read and process each request found on our connection
+           * until no request are left or we decide to close.
+           */
+          ap_update_child_status(c->sbh, SERVER_BUSY_READ, NULL);
+          while ((r = ap_read_request(c)) != NULL) {
+            /* ... loop body before process request ... */
+            /* process the request if it was read without error */
+            if (r->status == HTTP_OK)
+              ap_process_request(r);
+            /* ... loop body after process request ... */
+          }
+        
+          return OK;
+        }
+    
+    下面看看函数 `ap_read_request` ：
+    
+        /* file: server/protocol.c:845 */
+        request_rec *ap_read_request(conn_rec *conn)
+        {
+          request_rec *r;
+          /* ... construct the request_rec object ... */
+          r = apr_pcalloc(p, sizeof(request_rec));
+          /* set each properties of r */
+          /* Must be set before we run create request hook */
+          ap_run_create_request(r);
+        
+          /* Get the request... */
+        
+          ap_add_input_filter_handle(ap_http_input_filter_handle,
+                                     NULL, r, r->connection);
+        
+          /* ... */
+        
+          if ((access_status = ap_run_post_read_request(r))) {
+            /* ... */
+          }
+        
+          ap_run_log_transaction(r);
+        
+          /* ... */
+        
+          return r;
+        }
+    
+    函数 `ap_read_request` 又运行了hook create\_request和hook
+    post\_read\_request。
+    
+    在 `ap_read_request` 成功且没有发生错误后，就表示请求已经成功的
+    接收到了，然后继续由
+    `ap_process_request` 来处理了，下面接续看函数
+    `ap_process_request` :
+    
+        /* file: modules/http/http_request.c */
+        void ap_process_request(request_rec *r)
+        {
+          /* Give quick handlers a shot at serving the request on the fast path,
+           * bypassing all of the other Apache hooks.
+           */
+          if (ap_extended_status)
+            ap_time_process_request(r->connection->sbh, START_PREQUEST);
+          access_status = ap_run_quick_handler(r, 0); /* Not a look-up request
+                                                       * */
+          if (access_status == DECLINE) {
+            access_status = ap_process_request_internal(r);
+            if (access_status == OK) {
+              access_status = ap_invoke_handler(r);
+            }
+          }
+        
+          if (access_status == DONE) {
+            /* e.g., something not in storage like TRACE */
+            access_status = OK;
+          }
+        
+          if (access_status == OK) {
+            ap_finalize_request_protocol(r);
+          }
+          else {
+            r->status = HTTP_OK;
+            ap_die(access_status, r);
+          }
+        
+          /*
+           * We want to flush the last packet if this isn't a pipelining
+           * connection *before* we start into logging. Suppose that logging
+           * cause a DNS lookup to occur, which may have a high latency. If we
+           * hold off on this packet, then it'll appear like the link is
+           * stalled when really it's the application that's stalled.
+           */
+          check_pipeline_flush(r);
+          ap_update_child_status(r->connection->sbh, SERVER_BUSY_LOG, r);
+          ap_run_log_transaction(r);
+          if (ap_extended_status)
+            ap_time_process_request(r->connection->sbh, STOP_PREQUEST);
+        }
+    
+    函数 `ap_process_request` 首先运行了hook quick\_handler，然后主要
+    调用了三个函数：
+    `ap_process_request_internal` ， `ap_invoke_handler` 和
+    `ap_finalize_request_protocol` 。
+    
+    从Apache2的developer文档中，可以看到函数
+    `ap_process_request_internal` 可以分为下面几个阶段：
+    
+    -   Request Parsing Phase
+        这阶段的动作有URI的检查，Location Walk，translate name (hook
+        translate\_name), map to storage (hook map\_to\_storage)，Header
+        parse (hook header\_parser)。
+    -   Security Phase
+    -   Preparation Phase
+        这阶段主要运行两个hook：type\_checker 和 fixups.
+    
+    上面三个阶段完成后，下面一步就是相应内容的产生，所以fixup就在产
+    生相应内容之前运行的最后一个hook了。
+    函数 `ap_invoke_handler` 继续完成下面这个阶段：
+    
+    -   Handler Phase
+        这个阶段首先运行hook insert\_filter，然后初始化filters，然后运
+        行hook handler：
+        
+            result = ap_run_handler(r);
+    
+    `ap_process_request` 最后调用了函数
+    `ap_finalize_request_protocol` 。
+    
+    这样这个请求就被处理完成了。
+2.  reqtimeout\_module
+    
+        /*
+         * mod_reqtimeout needs to be called before ap_process_http_request
+         * (which is run at APR_HOOK_REALLY_LAST) but after all other protocol
+         * modules. This ensures that it only influences normal http
+         * connections and not e.g. mod_ftp. Also, if mod_reqtimeout used the
+         * pre_connection hook, it would be insert on mod_proxy's backend
+         * connections.
+         */
+        ap_hook_process_connection(reqtimeout_init, NULL, NULL, APR_HOOK_LAST);
+    
+    reqtimeout\_module是给Apache2 server提供设置超时的一个模块，提供
+    了很细致的超时控制，如接受http header的超时定时器，接受body的超
+    时定时器等。
+    
+    `reqtimeout_init` 所做的就是获取配置信息等工作。
+3.  echo\_module
+    
+        ap_hook_process_connection(process_echo_connection, NULL,
+                                   NULL, APR_HOOK_MIDDLE);
+    
+    echo\_module是什么模块呢？原来Apache的模块中有一类是协议模块，做
+    为http server的Apache2，http\_module是必不可少的，此外还有一些协
+    议模块如ftp模块，ftp\_module则可以使Apache2变成一个ftp server。
+    echo\_module也是一个协议模块，只不过echo\_module实现的协议相当简单：
+    echo server，开启echo\_module后，telnet到Apache2 server上，
+    echo\_module就简单的返回所有接收到的数据。
+    
+    所以函数 `process_echo_connection` 就很简单，它首先得到配置，查
+    看echo是否被启动，如果没有启用就返回DECLINE，如果启用了则从接受
+    到的数据中一行行的读取，没读取一行就返回同样的数据给客户端。
+4.  example\_module
+    
+        ap_hook_process_connection(x_process_connection, NULL, NULL,
+                                   APR_HOOK_MIDDLE);
+    
+    example\_module在前面提到了是Apache2的一个示例模块快，给模块开发者提供一个示
+    范。所以在 `x_process_connection` 函数中，example\_module什么事情
+    也没有做，只是返回DECLINE。
+
+完了。
+
+## request\_rec结构<a id="orgheadline12"></a>
+
+request\_rec是一个庞大的结构
+
+### request\_time<a id="orgheadline11"></a>
+
+request\_time表示接收到这个请求的时间，在函数 `read_request_line`
+里面被标记上了，它又被 `ap_read_request` 调用，在上面知道了
+`ap_read_request` 是 `ap_process_connection` 的第一步。
+
+# Notes<a id="orgheadline14"></a>
+
+-   Last update: <span class="timestamp-wrapper"><span class="timestamp">[2011-11-24 Thu 16:46] </span></span>
